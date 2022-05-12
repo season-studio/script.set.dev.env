@@ -1,0 +1,65 @@
+#!/data/data/com.termux/files/usr/bin/bash
+showUsage()
+{
+    echo -e "\e[1;33mRun background task in proot-distro.\e[0m"
+    echo -e "\e[1;33mUsage:\e[0m"
+    echo -e "\e[33m    $0 <config-script> <proot-distro-alias> [options]\e[0m"
+    echo -e "\e[1;33mOptions:\e[0m"
+    echo -e "\e[33m    --start \tstart the task\e[0m"
+    echo -e "\e[33m    --show \tshow the output of the task\e[0m"
+    echo -e "\e[33m    --stop \tstop the task\e[0m"
+    echo -e "\e[33m    --check \tcheck the status of the task\e[0m"
+    echo -e "\e[33m    --keepalive\tkeep the task is alive\e[0m"
+    echo -e "\e[33m    --clearlog \tclear the log\e[0m"
+}
+
+if [[ "$_proot_task_bg_flag" == "_proot_task_bg_flag" ]]; then
+
+    if [ "$(test -r $1&&echo 1)" != "1" ]; then
+        echo -e "\e[1;31mExpect the config-script\e[0m"
+        showUsage
+        exit 2
+    fi
+
+    file_basename=$(basename $1)
+    pid_file="$def_log_dir/$file_basename-$2.pid"
+    log_file="$def_log_dir/$file_basename-$2.log"
+
+    start_in_proot()
+    {
+        echo ""
+    }
+
+    stop_in_proot()
+    {
+        echo ""
+    }
+
+    . $*
+
+    start_cmd()
+    {
+        cmd_str=$(start_in_proot $*)
+        if [[ x"$cmd_str" == x ]]; then
+            echo -e "\e[1;31mExpect command return by cmd_in_proot in the config-sccript\e[0m" >/proc/$$/fd/2
+            exit 3
+        fi
+        echo "proot-distro login $3 --bind $HOME/vshare:/vshare -- $cmd_str"
+    }
+
+    stop_cmd()
+    {
+        cmd_str=$(stop_in_proot $*)
+        if [[ x"$cmd_str" == x ]]; then
+            echo -e "\e[34mNo command return by stop_in_proot. KILL Signal will be send directly." >/proc/$$/fd/2
+            echo ""
+        else
+            echo "proot-distro login $3 --bind $HOME/vshare:/vshare -- $cmd_str"
+        fi
+    }
+
+else
+    export _proot_task_bg_flag="_proot_task_bg_flag"
+    export _task_bg_lock_file=$1
+    ${0%/*}/task-bg $0 $*
+fi

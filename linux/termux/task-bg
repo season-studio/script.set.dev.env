@@ -1,0 +1,138 @@
+#!/data/data/com.termux/files/usr/bin/bash
+showUsage()
+{
+    echo -e "\e[1;33mRun task in background.\e[0m"
+    echo -e "\e[1;33mUsage:\e[0m"
+    echo -e "\e[33m    $0 <config-script> [options]\e[0m"
+    echo -e "\e[1;33mOptions:\e[0m"
+    echo -e "\e[33m    --start \tstart the task\e[0m"
+    echo -e "\e[33m    --show \tshow the output of the task\e[0m"
+    echo -e "\e[33m    --stop \tstop the task\e[0m"
+    echo -e "\e[33m    --check \tcheck the status of the task\e[0m"
+    echo -e "\e[33m    --keepalive\tkeep the task is alive\e[0m"
+    echo -e "\e[33m    --clearlog \tclear the log\e[0m"
+}
+
+if [ $# -eq 0 ]; then
+    showUsage
+    exit 1
+fi
+if [ "$(test -r $1&&echo 1)" != "1" ]; then
+    echo -e "\e[1;31mExpect the config-script\e[0m"
+    showUsage
+    exit 2
+fi
+
+if [[ x"$_task_bg_lock_file" == x ]]; then
+	lock_file=$1
+else
+	lock_file=$_task_bg_lock_file
+fi
+
+if [[ " $@ " =~ " --silent" ]]; then
+    tip()
+    {
+        echo "" > /dev/null
+    }
+else
+    tip()
+    {
+        echo -e "$*"
+    }
+fi
+
+if [[ " $@ " =~ " --keepalive " ]] || [[ " $@ " =~ " --start " ]] && [[ "$_lock_flag" != "$lock_file" ]]; then
+    flock -x -n $lock_file -c "export _lock_flag=\"$lock_file\"; $0 $*" || tip "\e[1;31mAnother instance is running\e[0m"
+else
+    file_basename=$(basename $1)
+    def_log_dir="$HOME/vshare/run/log"
+    pid_file="$def_log_dir/$file_basename.pid"
+    log_file="$def_log_dir/$file_basename.log"
+
+    start_cmd()
+    {
+        echo ""
+    }
+
+    stop_cmd()
+    {
+        echo ""
+    }
+
+    check_status()
+    {
+        if [[ -r $pid_file ]]; then
+            _ps_state=$(ps -o s --no-headers $(cat $pid_file 2>/dev/null) 2>/dev/null)
+            if [[ "$_ps_state" == "T" ]] || [[ "$_ps_state" == "Z" ]] || [[ "$_ps_state" == "X" ]] || [[ x"$_ps_state" == x ]]; then
+                return 1
+            else
+                return 0
+            fi
+        else
+            return 255
+        fi
+    }
+
+    . $*
+
+    do_start()
+    {
+        cmd_str=$(start_cmd $*)
+        if [ x"$cmd_str" = x ]; then
+            tip "\e[1;31mExpect the starting command of the task return by the start_cmd function in the config-script\e[0m"
+        else
+            nohup $cmd_str >>"$log_file" 2>&1 &
+            echo $! >"$pid_file"
+            tip "\e[1;34mOK\e[0m"
+        fi
+    }
+
+    if [[ " $* " =~ " --show " ]]; then
+        if [ -r $log_file ]; then
+            cat $log_file
+        else
+            tip "\e[1;34m$log_file is not a readable file\e[0m"
+        fi
+    elif [[ " $@ " =~ " --stop " ]]; then
+        if [[ -r $pid_file ]]; then
+            cmd_str=$(stop_cmd $*)
+            if [ x"$cmd_str" = x ]; then
+                tip "\e[32mSend KILL signal to the process\e[0m"
+                kill -9 $(cat $pid_file 2>/dev/null) > /dev/null 2>&1
+            else
+                $cmd_str
+            fi
+            tip "\e[32mWaiting for stopping...\e[0m"
+            flock -x $lock_file -c "echo 'Done'"
+            rm -f $pid_file > /dev/null 2>&1
+        else
+            tip "\e[1;31mCan not read from PID file $pid_file\e[0m"
+        fi
+    elif [[ " $@ " =~ " --check " ]]; then
+        check_status $*
+        state_ret=$?
+        if [ $state_ret -eq 0 ]; then
+            echo -e "\e[1;34mTask is active\e[0m"
+        elif [ $state_ret -lt 255 ]; then
+            echo -e "\e[1;31mTask is deactive\e[0m"
+        else
+            echo -e "\e[1;33mTask is stopped\e[0m"
+        fi
+    elif [[ " $@ " =~ " --keepalive " ]]; then
+        check_status $*
+        state_ret=$?
+        if [ $state_ret -gt 0 ] && [ $state_ret -lt 255 ]; then
+            do_start $*
+        else
+            tip "\e[1;31mTask have not been started!\e[0m"
+        fi
+    elif [[ " $@ " =~ " --start " ]]; then
+        do_start $*
+    elif [[ " $@ " =~ " --clearlog " ]]; then
+        rm -f $log_file
+    else
+        tip "\e[1;31mUnknown options\e[0m"
+        showUsage
+        exit 3
+    fi
+fi
