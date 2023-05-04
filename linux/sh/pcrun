@@ -1,0 +1,621 @@
+#!/bin/bash
+#/*
+if [ ! $NOLOGON ]; then
+    echo -e "\e[1;34mRun Simple Container in WSL\e[0m"
+fi
+# 错误提示函数
+function showError {
+    echo -e "\e[31m$*\e[0m"
+}
+# 注释提示函数
+function showComment {
+    echo -e "\e[2;32m$*\e[0m"
+}
+# 信息提示函数
+function showInfo {
+    echo -e "\e[0;33m$*\e[0m"
+}
+# 必须以管理员运行
+if [ $EUID -ne 0 ]; then
+    showError "MUST run as the root"
+    exit
+fi
+# 确认必须有参数
+if [ $# -lt 1 ]; then
+    showError "Need arguments"
+    showInfo "Usage:"
+    showInfo "$(basename $0) <container-script-file> [options]"
+    showInfo "options:"
+    echo -e "\e[1;32m--create-vhdx      \e[0mCreate a new vhdx with ext4 file system."
+    echo -e "\e[1;32m      --name=<v>   \e[0mOptional. The name of the vhdx file, taken the container's name as default."
+    echo -e "\e[1;32m      --folder=<v> \e[0mOptional. The folder to storage the vhdx file."
+    echo -e "\e[1;32m--unmount          \e[0mUnmount the merged rootfs of the container."
+    echo -e "\e[1;32m--release-vhdx     \e[0mRelease the vhdx mounted to the WSL by the container."
+    echo -e "\e[1;32m      --all        \e[0mOptional. Without this switcher, the vhdxs of the lower overlays won't be release."
+    echo -e "\e[1;32m--delete           \e[0mDelete the special container."
+    echo -e "\e[1;32m--exec=<v>         \e[0mExecute a command in the special container."
+    exit
+fi
+# 解析参数
+declare -A Args
+SubScript=""
+for argItem in $*; do
+    if [ "${argItem:0:2}" == "--" ]; then
+        opt="${argItem%%=*}"
+        optValue="${argItem#${opt}}"
+        optValue="${optValue:1}"
+        opt="${opt:2}"
+        Args+=( [$opt]="$optValue" )
+    else
+        if [ -z "$SubScript" ]; then
+            SubScript="$argItem"
+        fi
+    fi
+done
+
+# 用于子脚本中修改参数的函数
+function SetMethod {
+    if [ $# -gt 0 ]; then
+        Args+=( [$1]="$2" )
+    fi
+    for key in ${!Args[@]}; do
+        echo ${key} ${Args[${key}]}
+    done
+}
+
+########################################################
+# 定义工作变量
+########################################################
+# 当前脚本的路径
+ScriptDir="$(dirname $(readlink -f $0))"
+# 当前目录
+CurrentFolder="$PWD"
+# 挂载根目录
+MountRoot="/mnt"
+# WSL挂载根目录
+WSLMountRoot="$MountRoot/wsl"
+# 源数据所在的盘
+SourceDisk="d"
+# 源数据所在的目录（不含盘号）
+SourceFolder="WSL\\.docker"
+# 堆叠镜像源数据所在的目录（不含盘号）
+OverlaySourceFolder="$SourceFolder\\overlays"
+# 容器的名称
+ContainerName=""
+# 容器的配置根目录
+ContainerConfigsRoot="/Docker/containers"
+# 容器的Overlays根目录
+ContainerOverlaysRoot="/Docker/overlays"
+# overlayfs命令
+OverlayfsExe="fuse-overlayfs"
+# overlayfs类型
+OverlayFSType="fuse.fuse-overlayfs"
+# OCI命令
+OCI="crun"
+
+########################################################
+# 当有子脚本时加载子脚本
+########################################################
+if [ -n "$SubScript" ] && [ -e "$SubScript" ]; then
+    # 将当前目录设为子脚本的目录，并将子脚本名作为默认容器名
+    ContainerName=$(basename "$SubScript")
+    CurrentFolder=$(dirname $(readlink -f "$SubScript"))
+    # 加载子脚本
+    . "$SubScript"
+fi
+
+function unmountPoint {
+    if [ $# -gt 0 ]; then
+        while [ -n "$(mount -t $OverlayFSType | grep "$1")" ]; do
+            umount "$1"
+        done
+    fi
+}
+
+if [ -v Args["launch"] ]; then
+    # 跳转启动容器脚本
+    containerScript=${Args["launch"]}
+    containerScript="$ContainerConfigsRoot/$containerScript/$containerScript"
+    if [ ! -x "$containerScript" ]; then
+        showError "$containerScript is not a executable file!"
+        exit
+    fi
+    passArgs=""
+    for key in ${!Args[@]}; do
+        if [ "$key" != "launch" ]; then
+            passArgs="$passArgs --$key=${Args[$key]}"
+        fi
+    done
+    export NOLOGON=1
+    exec $containerScript $passArgs
+elif [ -v Args["create-vhdx"] ]; then
+    # 为overlay创建虚拟磁盘文件
+    showInfo "Create VHDX for a Overlay"
+    diskFolder=${Args["folder"]:-"$SourceDisk:\\$OverlaySourceFolder"}
+    diskName=${Args["name"]:-"$ContainerName"}
+    diskName=${diskName:-"$(date +'%Y%m%d-%s')"}
+    diskPath="$diskFolder\\$diskName.vhdx"
+    # 创建vhdx文件
+    ret=$(powershell.exe -Command "if (![System.IO.File]::Exists(\"$diskPath\")) { gsudo New-VHD -Path (\"$diskPath\") -SizeBytes ${Args["size"]:-"1GB"} -Dynamic; if (\$?) { echo 0 } else { echo 1 } } else { echo 0; }")
+    if [ "$ret" = "0" ]; then
+        showError "Fail in creating $diskPath"
+        exit
+    fi
+    # 将vhdx映射到WSL中，并发现在WSL中还未格式化的新磁盘设备名
+    wsl.exe --mount --vhd "$diskPath" --bare
+    diskDevs=$(lsblk -o NAME,FSTYPE)
+    diskDevs=$(while read line; do if [ "${line/#* /==}" = "$line" ]; then echo "$line"; fi; done <<<$(lsblk -o NAME,FSTYPE))
+    count=0
+    for i in $diskDevs; do
+        count=$(($count + 1))
+    done
+    if [ $count -gt 0 ]; then
+        # 若存在多个未格式化的磁盘设备，则要手工指定一个
+        if [ $count -gt 1 ]; then
+            echo "There are more than one device unformatted:"
+            echo "$diskDevs"
+            diskDevs=""
+            while [ -z "$diskDevs" ]; do
+                read -p "Choose one: " diskDevs
+                if [ ! -e "$diskDevs" ]; then
+                    diskDevs=""
+                fi
+            done
+        fi
+        # 格式化磁盘未ext4格式
+        diskDev="/dev/$diskDevs"
+        if [ ! -e "$diskDev" ]; then
+            showError "The device $diskDev is invalid!"
+            exit
+        fi
+        mkfs.ext4 -t ext4 "$diskDev"
+    fi
+    # 卸载掉vhdx磁盘，然后重新加载，并自动挂载到以磁盘文件名为名称的挂载点上
+    powershell.exe -Command "cd \"$diskFolder\"; wsl.exe --unmount \"./$diskName.vhdx\""
+    wsl.exe --mount --vhd "$diskPath" --name "$diskName"
+    if [ ! -d "$WSLMountRoot/$diskName" ]; then
+        showError "Mounting $diskName FAIL!"
+    else
+        echo "The vhdx file is $diskPath"
+        showInfo "The mount point is $WSLMountRoot/$diskName"
+    fi
+elif [ -v Args["unmount"] ]; then
+    # 卸载挂载点
+    showInfo "Unmount the overlays"
+    if [ -n "$($OCI list | grep "$ContainerName")" ]; then
+        read -n 1 -p "Are you sure to delete the container first?(y/n): " isRemove
+        echo ""
+        if [ "$isRemove" != "y" ] && [ "$isRemove" != "Y" ]; then
+            exit
+        fi
+        $OCI delete "$ContainerName"
+        if [ $? -ne 0 ]; then
+            showError "FAIL($?) in deleting the container"
+            exit
+        fi
+    fi
+    unmountPoint "$ContainerOverlaysRoot/$ContainerName/merged"
+elif [ -v Args["release-vhdx"] ]; then
+    # 释放VHDX
+    showInfo "Unmount the overlays and Release all the vhdx from the WSL"
+    if [ -n "$ContainerName" ] && [ -n "$($OCI list | grep "$ContainerName")" ]; then
+        read -n 1 -p "Are you sure to delete the container first?(y/n): " isRemove
+        echo ""
+        if [ "$isRemove" != "y" ] && [ "$isRemove" != "Y" ]; then
+            exit
+        fi
+        $OCI delete "$ContainerName"
+        if [ $? -ne 0 ]; then
+            showError "FAIL($?) in deleting the container"
+            exit
+        fi
+    fi
+    unmountPoint "$ContainerOverlaysRoot/$ContainerName/merged"
+    Overlays=${Overlays:=}
+    diskFolder="$SourceDisk:\\$OverlaySourceFolder"
+    mountList=$(mount)
+    if [ -v Args["all"] ]; then
+        for item in $Overlays; do
+            if [ -n "$(grep "$WSLMountRoot/$item" <<< "$mountList")" ]; then
+                powershell.exe -Command "cd \"$diskFolder\"; wsl.exe --unmount \"./$item.vhdx\""
+            fi
+        done
+    fi
+    if [ -n "$(grep "$WSLMountRoot/$ContainerName" <<< "$mountList")" ]; then
+        powershell.exe -Command "cd \"$diskFolder\"; wsl.exe --unmount \"./$ContainerName.vhdx\""
+    fi
+elif [ -v Args["delete"] ]; then
+    # 删除容器
+    showInfo "Delete the container($ContainerName)"
+    if [ -n "$($OCI list | grep "$ContainerName")" ]; then
+        read -n 1 -p "Are you sure to delete the container?(y/n): " isRemove
+        echo ""
+        if [ "$isRemove" != "y" ] && [ "$isRemove" != "Y" ]; then
+            exit
+        fi
+        $OCI delete "$ContainerName"
+        if [ $? -ne 0 ]; then
+            showError "FAIL($?) in deleting the container"
+            exit
+        fi
+    fi
+else
+    # 加载容器
+    showInfo "Start Container"
+    # 加载底层堆叠
+    Overlays=${Overlays:=}
+    overlayLowers=""
+    for item in $Overlays; do
+        mountPath="$WSLMountRoot/$item"
+        if [ -z "$(mount | grep $mountPath)" ]; then
+            wsl.exe --mount --vhd "$SourceDisk:\\$OverlaySourceFolder\\$item.vhdx" --name "$item"
+            if [ ! -d "$mountPath" ]; then
+                showError "Mounting $item FAIL!"
+                exit
+            fi
+        fi
+        if [ -d "$mountPath/diff" ]; then
+            overlayLowers="$overlayLowers:$mountPath/diff"
+        else
+            overlayLowers="$overlayLowers:$mountPath"
+        fi
+    done
+    # 加载顶层堆叠（本容器自身文件层）
+    overlayUpper="$WSLMountRoot/$ContainerName"
+    if [ -z "$(mount | grep $overlayUpper)" ]; then
+        wsl.exe --mount --vhd "$SourceDisk:\\$OverlaySourceFolder\\$ContainerName.vhdx" --name "$ContainerName"
+        if [ ! -d "$overlayUpper" ]; then
+            showError "Mounting Container($ContainerName) Overlayer FAIL!"
+            exit
+        fi
+    fi
+    # Overlay堆叠
+    overlayWork="$overlayUpper/work"
+    overlayUpper="$overlayUpper/diff"
+    overlayMerged="$ContainerOverlaysRoot/$ContainerName/merged"
+    if [ -z "$(mount | grep "$overlayMerged")" ]; then
+        mkdir -p "$overlayUpper"
+        mkdir -p "$overlayWork"
+        mkdir -p "$overlayMerged"
+        $OverlayfsExe -o allow_other,use_ino,cow -o lowerdir=$overlayLowers,upperdir=$overlayUpper,workdir="$overlayWork" "$overlayMerged"
+    fi
+    showComment "Container merged rootfs is $overlayMerged"
+    # 创建配置文件
+    if [ ! -x "/usr/bin/deno" ]; then
+        cp "$ScriptDir/deno" /usr/bin/deno
+        chmod +x /usr/bin/deno
+        if [ ! -x "/usr/bin/deno" ]; then
+            showError "Cannot location the DENO for javascript"
+            exit
+        fi
+    fi
+    ContainerConfigsDir="$ContainerConfigsRoot/$ContainerName"
+    mkdir -p "$ContainerConfigsDir"
+    jsCode=$(cat "$0")
+    jsCode="${jsCode##*\:\'javascript_begin_main}"
+    jsCode="${jsCode%%\/\*javascript_end_main\'*}"
+    addEnvValues="HOSTNAME:\"$HOSTNAME\",CONTAINER_NAME:\"$ContainerName\","
+    for envItem in $Environments; do
+        envKey="${envItem%%=*}"
+        envValue="${envItem##*=}"
+        addEnvValues="$addEnvValues $envKey:\"$envValue\","
+    done
+    addCfgValues="ContainerRootFS:\"$overlayMerged\",ContainerConfigsDir:\"$ContainerConfigsDir\","
+    EntryPointerJS=""
+    for epItem in $EntryPointer; do
+        EntryPointerJS="$EntryPointerJS \"$epItem\","
+    done
+    addCfgValues="$addCfgValues EntryPointer:[$EntryPointerJS],"
+    addCfgValues="$addCfgValues EntryPointerPWD:\"${EntryPointerPWD-"/"}\","
+    MountsJS=""
+    for bindItem in $Mounts; do
+        MountsJS="$MountsJS \"$bindItem\","
+    done
+    addCfgValues="$addCfgValues Mounts:[$MountsJS],"
+    modifiedCfgs="$(deno eval "const ExistedCfgs=\`$(cat "$ContainerConfigsDir/config.json" 2>/dev/null)\`; const AddEnvs={$addEnvValues}; const AddCfgs={$addCfgValues}; $jsCode")"
+    if [ -n "$modifiedCfgs" ]; then
+        if [ -e "$ContainerConfigsDir/config.json" ]; then
+            if [ -n "$($OCI list | grep "$ContainerName")" ]; then
+                read -n 1 -p "The configuration will be changed for the existing container($ContainerName). Remove the container first?(y/n): " isRemove
+                echo ""
+                if [ "$isRemove" != "y" ] && [ "$isRemove" != "Y" ]; then
+                    showError "Nothing changed for the configuration!"
+                    exit
+                fi
+                $OCI delete "$ContainerName"
+                if [ $? -ne 0 ]; then
+                    showError "FAIL($?) in remove the container"
+                    exit
+                fi
+            fi
+        fi
+        echo "$modifiedCfgs" > "$ContainerConfigsDir/config.json"
+    fi
+    # 如果有启动标志，则执行启动动作
+    if [ -v Args["exec"] ]; then
+        # 如果容器不存在，则先创建容器
+        if [ -z "$($OCI list | grep "$ContainerName")" ]; then
+            cd "$ContainerConfigsDir"
+            $OCI create "$ContainerName"
+            if [ $? -ne 0 ]; then
+                showError "FAIL($?) in create the container"
+                exit
+            fi
+        fi
+        $OCI exec --tty "$ContainerName" "${Args["exec"]}"
+    else
+        showComment "Mount overlays of the container without executing anything"
+    fi
+fi
+exit
+
+:'javascript_begin_main
+/**/
+
+const DefaultConfig = {
+    "ociVersion": "1.0.2-dev",
+    "process": {
+        "terminal": false,
+        "user": {
+            "uid": 0,
+            "gid": 0
+        },
+        "args": [
+            "/bin/sh"
+        ],
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm-256color"
+        ],
+        "cwd": "/",
+        "capabilities": {
+            "bounding": [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SETFCAP",
+                "CAP_SETGID",
+                "CAP_SETPCAP",
+                "CAP_SETUID",
+                "CAP_SYS_CHROOT",
+                "CAP_NET_RAW"
+            ],
+            "effective": [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SETFCAP",
+                "CAP_SETGID",
+                "CAP_SETPCAP",
+                "CAP_SETUID",
+                "CAP_SYS_CHROOT",
+                "CAP_NET_RAW"
+            ],
+            "permitted": [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SETFCAP",
+                "CAP_SETGID",
+                "CAP_SETPCAP",
+                "CAP_SETUID",
+                "CAP_SYS_CHROOT",
+                "CAP_NET_RAW"
+            ],
+            "ambient": [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SETFCAP",
+                "CAP_SETGID",
+                "CAP_SETPCAP",
+                "CAP_SETUID",
+                "CAP_SYS_CHROOT",
+                "CAP_NET_RAW"
+            ]
+        },
+        "rlimits": [
+            {
+                "type": "RLIMIT_NOFILE",
+                "soft": 1048576,
+                "hard": 1048576
+            },
+            {
+                "type": "RLIMIT_NPROC",
+                "soft": 31118,
+                "hard": 31118
+            }
+        ],
+        "noNewPrivileges": true
+    },
+    "root": {
+        "path": "/Docker/mounts/ubuntu",
+        "readonly": false
+    },
+    "hostname": "Ubuntu-18046",
+    "mounts": [
+        {
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc"
+        },
+        {
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "strictatime",
+                "mode=755",
+                "size=65536k"
+            ]
+        },
+        {
+            "destination": "/dev/pts",
+            "type": "devpts",
+            "source": "devpts",
+            "options": [
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620",
+                "gid=5"
+            ]
+        },
+        {
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "mode=1777",
+                "size=65536k"
+            ]
+        },
+        {
+            "destination": "/dev/mqueue",
+            "type": "mqueue",
+            "source": "mqueue",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev"
+            ]
+        },
+        {
+            "destination": "/sys",
+            "type": "sysfs",
+            "source": "sysfs",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "ro"
+            ]
+        },
+        {
+            "destination": "/sys/fs/cgroup",
+            "type": "cgroup",
+            "source": "cgroup",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "relatime",
+                "ro"
+            ]
+        }
+    ],
+    "linux": {
+        "resources": {
+            "devices": [
+                {
+                    "allow": false,
+                    "access": "rwm"
+                }
+            ]
+        },
+        "namespaces": [
+            {
+                "type": "pid"
+            },
+            {
+                "type": "ipc"
+            },
+            {
+                "type": "uts"
+            },
+            {
+                "type": "mount"
+            },
+            {
+                "type": "cgroup"
+            }
+        ],
+        "maskedPaths": [
+            "/proc/acpi",
+            "/proc/asound",
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+            "/proc/sched_debug",
+            "/sys/firmware",
+            "/proc/scsi"
+        ],
+        "readonlyPaths": [
+            "/proc/bus",
+            "/proc/fs",
+            "/proc/irq",
+            "/proc/sys",
+            "/proc/sysrq-trigger"
+        ]
+    }
+}
+
+let Configs=JSON.parse(JSON.stringify(DefaultConfig));
+let EntryPointer=AddCfgs.EntryPointer.filter((e) => String(e||"").trim());
+(EntryPointer.length > 0) && (Configs.process.args = EntryPointer);
+Configs.process.cwd = AddCfgs.EntryPointerPWD;
+Configs.root.path = AddCfgs.ContainerRootFS;
+Configs.hostname = AddEnvs.HOSTNAME;
+let Envs = Configs.process.env;
+for (let key in AddEnvs) {
+    let idx = Envs.findIndex(e => String(e).startsWith(`${key}=`));
+    if (idx >= 0) {
+        Envs[idx] = `${key}=${AddEnvs[key]}`;
+    } else {
+        Envs.push(`${key}=${AddEnvs[key]}`);
+    }
+}
+let Mounts = Configs.mounts;
+let AddMounts = AddCfgs.Mounts;
+for (let mountItem of AddMounts) {
+    let {0:src,1:dest,2:ro}=String(mountItem).split(":");
+    let foundItem = Mounts.find((e) => e.destination === dest);
+    if (!foundItem) {
+        foundItem = { destination: dest };
+        Mounts.unshift(foundItem);
+    }
+    foundItem.type = "bind";
+    foundItem.source = src;
+    foundItem.options = [
+        (ro === "ro") ? "ro" : "rw",
+        "rprivate",
+        "noexec",
+        "nosuid",
+        "nodev",
+        "rbind"
+    ];
+}
+Configs = JSON.stringify(Configs);
+let existedCfgsStr;
+try {
+    existedCfgsStr = JSON.stringify(JSON.parse(ExistedCfgs||"{}"));
+} catch {
+    existedCfgsStr = "";
+}
+if (existedCfgsStr === Configs) {
+    console.log("");
+} else {
+    console.log(Configs);
+}
+
+/*javascript_end_main'
+#*/
