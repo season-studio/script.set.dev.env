@@ -1,0 +1,24 @@
+#!/bin/bash
+
+if [ "$1" == "off" ]; then
+	export http_proxy=""
+	export https_proxy=""
+	export PS1="${PS1##\\[\\e[31m\\\][P\]\\[\\e[0m\\\]}"
+	echo "Proxy OFF"
+else
+	proxyPort=$1
+	proxyPort="${proxyPort:=45717}"
+	proxyIP=$(ip route show | grep default)
+	proxyIP=${proxyIP##* via }
+	proxyIP=${proxyIP%% dev *}
+	echo "Proxy server is $proxyIP:$proxyPort"
+	export proxy_url="http://$proxyIP:$proxyPort"
+	export proxy_socks="socks5://$proxyIP:$proxyPort"
+	export http_proxy="$proxy_url"
+	export https_proxy="$proxy_url"
+	PS1="${PS1##\\[\\e[31m\\\][P\]\\[\\e[0m\\\]}"
+	export PS1="\[\e[31m\][P]\[\e[0m\]$PS1"
+	echo "Proxy ON"
+fi
+
+
